@@ -460,3 +460,37 @@ class TestPallasAttentionBackendImpl:
                 layer_name_to_kvcache_index={'0': 0},
                 vllm_config=vllm_config):
             impl.forward(layer, query, key, value, torch.tensor([]), metadata)
+
+    def test_forward_encoder_only_with_rpa(self, mesh):
+        import os
+        from unittest.mock import patch
+
+        impl = PallasAttentionBackendImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_DIM,
+            scale=0.088,
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            attn_type=AttentionType.ENCODER_ONLY,
+        )
+
+        layer = MagicMock()
+        layer.layer_name = "0"
+
+        query, key, value, _, metadata = create_inputs(mesh)
+        metadata.padded_num_reqs = MAX_NUM_SEQS
+
+        from vllm.config import VllmConfig
+        vllm_config = MagicMock(spec=VllmConfig)
+        vllm_config.model_config = MagicMock()
+        vllm_config.model_config.max_model_len = 128
+
+        with patch.dict(os.environ, {"TPU_INFERENCE_USE_RPA_FOR_ENCODER": "1"}):
+            with torchax.default_env(), set_vllm_model_wrapper_context(
+                    kv_caches=[],
+                    mesh=mesh,
+                    layer_name_to_kvcache_index={'0': 0},
+                    vllm_config=vllm_config):
+                impl.forward(layer, query, key, value, torch.tensor([]), metadata)

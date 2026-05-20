@@ -17,7 +17,7 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from tpu_inference import utils
-from tpu_inference.layers.common.attention_interface import attention, sharded_flash_attention, BlockSizes
+from tpu_inference.layers.common.attention_interface import attention, sharded_flash_attention, BlockSizes, sharded_ragged_paged_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.kernels.flash_attention.kernel import SegmentIds
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -185,18 +185,45 @@ class PallasAttentionBackendImpl(AttentionImpl):
         v_jax = jax_view(value)
 
         if self.attn_type == AttentionType.ENCODER_ONLY:
-            # --- EncoderOnly Attention Flow (No Cache) ---
-            outputs = _jax_encoder_only_attn_func(
-                q_jax,
-                k_jax,
-                v_jax,
-                attn_metadata,
-                mesh,
-                self.scale,
-                self.head_size,
-                self.num_heads,
-                self.num_kv_heads,
-            )
+            # --- EncoderOnly Attention Flow ---
+            import os
+            use_rpa = os.environ.get("TPU_INFERENCE_USE_RPA_FOR_ENCODER") == "1"
+
+            if use_rpa:
+                vllm_config = vllm_model_wrapper_context.vllm_config
+                if vllm_config is not None:
+                    max_model_len = vllm_config.model_config.max_model_len
+                else:
+                    from vllm.config import get_current_vllm_config
+                    max_model_len = get_current_vllm_config().model_config.max_model_len
+
+                batch_size = attn_metadata.padded_num_reqs
+
+                outputs = _jax_encoder_only_attn_func_rpa(
+                    q_jax,
+                    k_jax,
+                    v_jax,
+                    attn_metadata,
+                    mesh,
+                    self.scale,
+                    self.head_size,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    max_model_len,
+                    batch_size,
+                )
+            else:
+                outputs = _jax_encoder_only_attn_func(
+                    q_jax,
+                    k_jax,
+                    v_jax,
+                    attn_metadata,
+                    mesh,
+                    self.scale,
+                    self.head_size,
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
         else:
             # --- Decoder Attention Flow (Paged KV Cache) ---
             if kv_cache.numel():
@@ -425,3 +452,75 @@ def _jax_encoder_only_attn_func(
     # Unpad and transpose back to vLLM's shape convention
     output = output_htd[:, :q_len, :].swapaxes(0, 1)
     return output.reshape(q_len, num_heads * head_size).astype(q.dtype)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "mesh",
+        "scale",
+        "head_size",
+        "num_heads",
+        "num_kv_heads",
+        "max_model_len",
+        "batch_size",
+    ),
+)
+def _jax_encoder_only_attn_func_rpa(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_metadata: AttentionMetadata,
+    mesh: Mesh,
+    scale: float,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    max_model_len: int,
+    batch_size: int,
+) -> jax.Array:
+    page_size = 16
+    from tpu_inference.kernels.ragged_paged_attention.v3.util import get_dtype_packing
+    kv_packing = get_dtype_packing(q.dtype)
+
+    max_pages_per_seq = _ceiling_div(max_model_len, page_size)
+    total_num_pages = batch_size * max_pages_per_seq
+
+    # 1. Allocate Dummy Paged KV Cache in TPU HBM
+    dummy_kv_cache = jnp.zeros(
+        (total_num_pages, page_size, (num_kv_heads * 2) // kv_packing, kv_packing, head_size),
+        dtype=q.dtype
+    )
+
+    # 2. Generate contiguous page indices per sequence
+    page_indices = jnp.arange(batch_size)[:, None] * max_pages_per_seq + jnp.arange(max_pages_per_seq)[None, :]
+    page_indices = page_indices.ravel().astype(jnp.int32)
+
+    # 3. Metadata parameters
+    kv_lens = attention_metadata.seq_lens.astype(jnp.int32)
+    cu_q_lens = attention_metadata.query_start_loc.astype(jnp.int32)
+    distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+
+    from tpu_inference.layers.common.attention_interface import sharded_ragged_paged_attention
+
+    # 4. Instantiate the sharded RPA kernel
+    rpa_kernel = sharded_ragged_paged_attention(
+        mesh=mesh,
+        use_causal_mask=False,
+        update_kv_cache=True,
+        sm_scale=scale,
+    )
+
+    # 5. Run the sharded RPA kernel
+    _, output = rpa_kernel(
+        dummy_kv_cache,
+        q,
+        k,
+        v,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+
+    return output.reshape(q.shape[0], num_heads * head_size)
